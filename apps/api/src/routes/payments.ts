@@ -1,70 +1,55 @@
-import express, { Router } from 'express';
+import { Router } from 'express';
 import { PrismaClient } from '@prisma/client';
 import { authenticate } from '../middleware/auth';
 
 const router = Router();
 const prisma = new PrismaClient();
 
-// Create Payment (Stripe or PayPal)
+// Create a pending payment record using the server-calculated order total.
+// Real gateway intents must be created with configured Stripe/PayPal credentials.
 router.post('/', authenticate, async (req: any, res) => {
   try {
-    const { orderId, method, amount } = req.body;
+    const { orderId, method } = req.body;
+    if (typeof orderId !== 'string' || !orderId || !['CREDIT_CARD', 'PAYPAL'].includes(method)) {
+      return res.status(400).json({ error: 'A valid orderId and payment method are required' });
+    }
 
-    // Verify order exists
-    const order = await prisma.order.findUnique({
-      where: { id: orderId },
-    });
-
+    const order = await prisma.order.findUnique({ where: { id: orderId } });
     if (!order) {
       return res.status(404).json({ error: 'Order not found' });
     }
+    if (order.userId !== req.userId) {
+      return res.status(403).json({ error: 'You cannot pay for this order' });
+    }
+    if (order.paymentStatus === 'COMPLETED') {
+      return res.status(409).json({ error: 'Order has already been paid' });
+    }
 
-    // Create payment record
     const payment = await prisma.payment.create({
       data: {
         orderId,
         method,
-        amount,
-        transactionId: `TXN-${Date.now()}`,
+        amount: order.total,
         gateway: method === 'CREDIT_CARD' ? 'stripe' : 'paypal',
         status: 'PENDING',
       },
     });
 
-    // TODO: Integrate with Stripe/PayPal API
-
-    res.json({
+    return res.status(201).json({
       payment,
-      clientSecret: 'test_secret', // Would be from Stripe/PayPal
+      message: 'Payment is pending. A configured payment gateway is required to complete it.',
     });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to create payment' });
+  } catch {
+    return res.status(500).json({ error: 'Failed to create payment' });
   }
 });
 
-// Verify Payment
-router.post('/verify/:paymentId', authenticate, async (req: any, res) => {
-  try {
-    const { transactionId } = req.body;
-
-    const payment = await prisma.payment.update({
-      where: { id: req.params.paymentId },
-      data: {
-        status: 'COMPLETED',
-        transactionId,
-      },
-    });
-
-    // Update order payment status
-    await prisma.order.update({
-      where: { id: payment.orderId },
-      data: { paymentStatus: 'COMPLETED' },
-    });
-
-    res.json(payment);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to verify payment' });
-  }
+// Clients must never be allowed to mark a payment complete by supplying a
+// transaction ID. Completion must be confirmed by a verified gateway webhook.
+router.post('/verify/:paymentId', authenticate, async (_req: any, res) => {
+  return res.status(501).json({
+    error: 'Client-side payment verification is disabled; use a verified gateway webhook',
+  });
 });
 
 export default router;
